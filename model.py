@@ -1,5 +1,6 @@
 from typing import cast,TypeAlias
 from collections import namedtuple, deque
+from itertools import pairwise
 
 import torch
 from torch import nn
@@ -25,6 +26,7 @@ ARCH: Arch = (
 
 TIME_DIM = 512
 TIMESTEP = 1000
+TAU = list(range(0, TIMESTEP+1, 40))
 
 #--------------------------------------------------------------------
 def sinPosEmbed( time_step = TIMESTEP, dim = TIME_DIM):
@@ -50,7 +52,7 @@ class ResBlock(nn.Module):
         self.norm2 = nn.GroupNorm(num_groups, ch.m)
         self.conv2 = nn.Conv2d(ch.m, ch.o, 3, padding=1)
         self.time_proj = nn.Linear(time_emb_dim, ch.m)
-        self.act = nn.SiLU()  # 或 nn.SiLU(inplace=True)
+        self.act = nn.SiLU()  # or nn.SiLU(inplace=True)
         self.shortcut = nn.Conv2d(ch.i, ch.o, 1)
 
     def forward(self, x: Tensor, t_emb):
@@ -178,7 +180,7 @@ class Unet(nn.Module):
         tail_layer.is_tail = True
 
         self.decoder = nn.ModuleList( UpLayer(io_ch, ted) for io_ch in self.decoder_arch)
-        head_layer = cast(UpLayer, self.decoder[0])
+        head_layer: UpLayer = cast(UpLayer, self.decoder[0])
         head_layer.is_head = True
         # The decoder has an architecture symmetric to that of the encoder.
 
@@ -198,7 +200,7 @@ class Unet(nn.Module):
         return y
 
 
-class DDPM(nn.Module):
+class DDIM(nn.Module):
     def __init__(self, arch, dim, time_emb_dim):
         super().__init__()
         self.arch = arch
@@ -210,21 +212,23 @@ class DDPM(nn.Module):
         s = 0.008
         timesteps = torch.arange(self.T + 1, dtype=torch.float32) / self.T # 0...T
         alpha_bar = torch.cos((timesteps + s) / (1 + s) * torch.pi / 2) ** 2
-        alpha_bar = alpha_bar / alpha_bar[0]
-        betas = 1 - (alpha_bar[1:] / alpha_bar[:-1]) # 1...T
-        self.beta = torch.clip(betas, 0, 0.999)
-        self.alpha_bar = alpha_bar[1:] / alpha_bar[0]  # 1...T
+        alpha_bar = alpha_bar / alpha_bar[0]  # 0...T, alpha_bar[0] = 1
+
+        betas = torch.zeros_like(alpha_bar)
+        betas[1:] = 1 - (alpha_bar[1:] / alpha_bar[:-1])  # 0...T
+        self.alpha_bar = alpha_bar
+        self.betas = betas
 
         # self.beta = torch.linspace(0.0001, 0.02, self.T)
         # self.alpha = 1-self.beta
         # self.alpha_bar = torch.cumprod(self.alpha, dim=0)
 
-        self.sigma = torch.sqrt(self.beta)  # DDPM 使用 σ_t = sqrt(β_t)
+        self.sigma = torch.sqrt(self.betas)  # DDPM 使用 σ_t = sqrt(β_t)
 
         self.denoiser = Unet(arch, ted)
         self.time_mlp = MLP(ted, [ted,ted], activation_layer=nn.SiLU)
 
-    def denoise(self, xt, t: Tensor):
+    def noise_predicter(self, xt, t: Tensor):
         t_emb = self.time_emb[t-1]  # t>0
         t_emb = self.time_mlp(t_emb)
         eps_pred = self.denoiser(xt, t_emb)
@@ -232,30 +236,36 @@ class DDPM(nn.Module):
     
 
     @torch.no_grad()
-    def sample(self, shape, device):
+    def sample(self, shape, eta=0.4, tau: list[int]=TAU):
+        """
+        DDIM Sample:\\
+        sigma_t = eta * sqrt[ (1-alpha_{t-1}) / (1-alpha_t) ] * beta_t; 0<= eta <= 1\\
+        tau = [tau_1, tau_2, ..., tau_k] where tau_i in [0, T] and tau_1 = 0 < tau_2 < ... < tau_k = T
+        """
 
-        B = shape[0]
+        B, C, H, W = shape
+        tau = sorted(set(tau))
 
-        # 初始化 x_T ~ N(0, I)
-        x = torch.randn(shape, device=device)
+        assert tau[0] == 0, "tau_1 should be 0"
+        assert tau[-1] == self.T, "tau_k should be T"
+        assert 0.0 <= eta <= 1.0, "eta should be in [0.0, 1.0]."
 
-        steps = list(range(self.T, 0, -1))
+        x = torch.randn(shape)
+        steps = pairwise(reversed(tau)) # (tau_k, tau_{k-1}), (tau_{k-1}, tau_{k-2}), ..., (tau_2, tau_1)
 
-        for t in tqdm(steps, "Sample"):
-            t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+        for t_cur, t_pre in tqdm(steps, "DDIM Sample"):
+            t_batch = torch.full((B,), t_cur, dtype=torch.long)
 
-            eps_pred = self.denoise(x, t_batch)
+            eps_pred = self.noise_predicter(x, t_batch)
+            ac = self.alpha_bar[t_cur]  # alpha_bar_cur
+            ap = self.alpha_bar[t_pre]  # alpha_bar_pre
+            st = eta * self.sigma[t_cur]  # eta * orign_sigma_t
 
-            alpha_t = 1-self.beta[t-1]
-            alpha_bar_t = self.alpha_bar[t-1]
-            sigma_t = self.sigma[t-1]
+            z = torch.randn(shape)
 
-            z = torch.randn_like(x)
-
-            # 重参数化：x_{t-1} = (1/√α_t)(x_t - (1-α_t)/√(1-ᾱ_t) * ε_θ) + σ_t * z
-            scale = 1/torch.sqrt(alpha_t)
-            shift = (1-alpha_t) / torch.sqrt(1-alpha_bar_t)
-            var = sigma_t * z
-            x = scale * (x-shift*eps_pred) + var
+            # DDIM Sample
+            x0_pred = ( x - torch.sqrt(1-ac)*eps_pred ) / torch.sqrt(ac)
+            mean_x = torch.sqrt(ap)*x0_pred + torch.sqrt(1-ap-st**2)*eps_pred
+            x = mean_x + st*z
 
         return x
