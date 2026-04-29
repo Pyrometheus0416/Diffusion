@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Iterable, TypeAlias
+from typing import Iterable, TypeAlias, Callable
 from pathlib import Path
 
 from PIL import Image
@@ -67,14 +67,15 @@ class EMA:
     value: float = 50.0
     deviation: float = 0.0
     best: float = float('inf')
+    lerp: Callable[[float, float, float], float] = lambda a,b,w: a + (b-a)*w
 
     def update(self, new_value: float):
         if self.t == 0:
             self.value = new_value
         else:
-            self.value = self.decay * self.value + (1-self.decay) * new_value
+            self.value = self.lerp(self.value, new_value, 1-self.decay)
         # equivalent to the above line but more numerically stable
-        self.deviation = (self.value - new_value)**2  # MSE error
+        self.deviation = self.lerp(self.deviation, (self.value - new_value)**2, 1-self.decay)
         self.best = min(self.best, self.value)
         self.t += 1
 
@@ -106,11 +107,9 @@ def compute_average_image(image_folder: Path):
     
     return average_image
 
-
 #--------------------------------------------------------------------
 if __name__ == "__main__":
     src = Path(r"E:\CodeHub\Mydata\AnimeFace")
-
 
     avg_img = compute_average_image(src)
     if avg_img:
