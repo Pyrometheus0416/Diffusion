@@ -1,28 +1,31 @@
 from dataclasses import dataclass
 from pathlib import Path
-from statistics import mean, pstdev
 #--------------------------------------------------------------------
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, Subset
+from torch.amp import autocast, GradScaler
 
 import torchvision.transforms.v2 as transforms
 from torchvision.io import decode_image, write_jpeg
+from torchmetrics.image.fid import FrechetInceptionDistance as FID
 
 from tqdm import tqdm
 
 #--------------------------------------------------------------------
-from model import DDPM
+from model import DDIM
 from model import ARCH, TIMESTEP, TIME_DIM
+from img_dataset import AnimeFaceDataset
 
+from utils import EMA
 #--------------------------------------------------------------------
 torch.set_default_device('cpu') # 'cuda:0  [IMPORTANT!!!]
 DEVICE = torch.device('cpu') # 'cuda:0'
 torch.set_default_dtype(torch.float32)
 
 #--------------------------------------------------------------------
-CONTINUE = False # 是否从上次中断的地方继续训练
+CONTINUE = False
 
 EPOCH = 16
 BATCH_SIZE = 8
@@ -31,57 +34,48 @@ LR = 0.00005
 BETAS = (0.9, 0.999)
 
 #--------------------------------------------------------------------
-IMG_FLODER = Path(r"D:\CodeHub\Mydata\AnimeFace") # [IMPORTANT!!!]
-SAVE_PATH  = Path(__file__).parent / 'ddpm_cos.pth'
+IMG_FLODER = Path(r"E:\CodeHub\Mydata\AnimeFace") # [IMPORTANT!!!]
+SAVE_PTH_PATH  = Path(__file__).parent / 'ddim_cos.pth'
 SAVE_IMG_PATH = Path(__file__).parent / 'samples'
 
+assert IMG_FLODER.exists(), f"Image folder {IMG_FLODER} does not exist. Please check the path."
+if not SAVE_PTH_PATH.exists():
+    CONTINUE = False  # No checkpoint to continue
+    print(f"Warning: Checkpoint {SAVE_PTH_PATH} already exists. "
+          "It will be overwritten since CONTINUE is set to False.")
+if not SAVE_IMG_PATH.exists():
+    SAVE_IMG_PATH.mkdir(parents=True, exist_ok=True)
+
 #--------------------------------------------------------------------
-@dataclass
-class AnimeFaceDataset(Dataset):
-    floder: Path = IMG_FLODER
-    size: int = 80
-
-    # mean = (0.6881, 0.5887, 0.5722)
-    # std = (0.2396, 0.2511, 0.2294)
-    mean = (0.6946, 0.6517, 0.6813) # Quan_AnimeFace
-    std = (0.2310, 0.2461, 0.2241)  # Quan_AnimeFace
-    inv_std = tuple(1/std_i for std_i in std)
-    inv_mean = tuple(-istdi*meani for istdi,meani in zip(inv_std,mean))
-
-    transform = transforms.Compose([
-        transforms.RandomResizedCrop(size, (0.9,1.0), (6/7,7/6)),
-        # transforms.RandomRotation(degrees=5),
-        transforms.ColorJitter(0.05,0.05,0.05,0.02),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToDtype(torch.float32,scale=True),
-        # transforms.GaussianNoise(),
-        transforms.Normalize(mean, std),
-    ])
-
-    inv_trans = transforms.Compose([
-        transforms.Normalize(inv_mean,inv_std),
-        transforms.Lambda(lambda x:torch.clamp(x,min=0.0,max=1.0)),
-        transforms.ToDtype(torch.uint8,scale=True)
-    ])
-
-    def __post_init__(self):
-        self.path: tuple[Path,...] = tuple(self.floder.iterdir())
-
-    def __len__(self):
-        return len(self.path)
-    
-    def __getitem__(self, index):
-        img_path = self.path[index]
-        img_t = decode_image(img_path, "RGB").to(device=DEVICE)
-        return self.transform(img_t)
-
 face_dataset = AnimeFaceDataset(IMG_FLODER)
-# mini_face_dataset = Subset(face_dataset, list(range(128)))
-print("The dataset capability is ",len(face_dataset))
+# face_dataset = Subset(face_dataset, list(range(128)))
+print("▤ The dataset capability is",len(face_dataset))
+
+ddim_fid = FID(feature=64, reset_real_features=False)
+
+if not CONTINUE:
+    curr_epoch = 0
+    # init the fid with real dataset
+    face_dataset.transform = transforms.Resize(face_dataset.size)
+    # temporary transform for FID evaluation (without data augmentation)
+    fid_dataloader = DataLoader(
+        face_dataset,
+        shuffle=True,
+        batch_size=BATCH_SIZE,
+        drop_last=True,
+        generator=torch.Generator(device=DEVICE) # [IMPORTANT!!!]
+    )
+    ddim_fid.reset()
+    for img in tqdm(fid_dataloader, "Evaluating FID of real data"):
+        ddim_fid.update(img, real=True)
+    face_dataset.reset()
 
 #--------------------------------------------------------------------
-ddpm = DDPM(ARCH, TIME_DIM, TIMESTEP)
-ddpm_optim = optim.Adam(ddpm.parameters(), lr=LR, betas=BETAS)
+
+ddim = DDIM(ARCH, TIME_DIM, TIMESTEP)
+ddim_optim = optim.Adam(ddim.parameters(), lr=LR, betas=BETAS)
+scaler = GradScaler(DEVICE)
+loss_logger = EMA()
 
 dataloader = DataLoader(
         face_dataset,
@@ -92,61 +86,71 @@ dataloader = DataLoader(
     )
 
 if CONTINUE:
-    assert SAVE_PATH.exists(), "No pre-trained model detected, cannot continue training."
+    assert SAVE_PTH_PATH.exists(), "No pre-trained model detected, cannot continue training."
 
     print('Loading pre-trained model...')
-    checkpoint: dict = torch.load(SAVE_PATH)
-    ddpm.load_state_dict(checkpoint['ddpm'])
-    ddpm_optim.load_state_dict(checkpoint['ddpm_optim'])
+    checkpoint: dict = torch.load(SAVE_PTH_PATH)
+    curr_epoch = checkpoint['epoch'] + 1
+    ddim.load_state_dict(checkpoint['ddim'])
+    ddim_optim.load_state_dict(checkpoint['ddim_optim'])
+    ddim_fid.load_state_dict(checkpoint['ddim_fid'])
     print('Start training from loaded model...')
 
-loss_logger = []
+for epoch in range(curr_epoch, curr_epoch+EPOCH):
 
-for epoch in range(EPOCH):
-
-    ddpm.train() # 切换到训练模式
+    ddim.train() # 切换到训练模式
     for x0 in tqdm(dataloader, "Train"):
-        t = torch.randint(0, ddpm.T, (BATCH_SIZE,), device=DEVICE)
+        t = torch.randint(0, ddim.T, (BATCH_SIZE,), device=DEVICE)
         eps = torch.randn_like(x0)
-        alpha_bar_t = ddpm.alpha_bar[t].view(BATCH_SIZE,1,1,1)
+        alpha_bar_t = ddim.alpha_bar[t].view(BATCH_SIZE,1,1,1)
         xt = torch.sqrt(alpha_bar_t) * x0 + torch.sqrt(1 - alpha_bar_t) * eps
 
-        eps_pred = ddpm.denoise(xt, t)
+        eps_pred = ddim.noise_predicter(xt, t)
 
         loss = nn.functional.mse_loss(eps_pred, eps)
-        loss_logger.append(loss.item())
+        loss_logger.update(loss.item())
 
         loss.backward()
-        ddpm_optim.step()
-        ddpm_optim.zero_grad() # 梯度清零
+        ddim_optim.step()
+        ddim_optim.zero_grad() # 梯度清零
 
-    ddpm.eval()
+    ddim.eval()
     with torch.inference_mode():
-        h = w = face_dataset.size
-        x0_prod = ddpm.sample((1,3,h,w), DEVICE)
+        # h = w = face_dataset.size
+        h = w = 80
+        x0_prod = ddim.sample((1,3,h,w))
         image = AnimeFaceDataset.inv_trans(x0_prod[0])
         # image = image.cpu() [IMPORTANT!!!]
 
         write_jpeg(image, SAVE_IMG_PATH/'test.jpg')
 
+        for batch in tqdm(range(len(face_dataset) // BATCH_SIZE), "Evaluating FID of generated data"):
+            x0_prod = ddim.sample((BATCH_SIZE,3,h,w))
+            img_prod = face_dataset.inv_trans(x0_prod)
+            ddim_fid.update(img_prod, real=False)
+        fid_score = ddim_fid.compute().item()
+        # ddim_fid.reset()  # reset FID generator features for the next epoch
+
     checkpoint = {
         'epoch': epoch,
-        'ddpm': ddpm.state_dict(),
-        'ddpm_optim': ddpm_optim.state_dict(),
+        'ddim': ddim.state_dict(),
+        'ddim_optim': ddim_optim.state_dict(),
         'loss': loss,
+        'ddim_fid': ddim_fid.state_dict(),
         # 'scheduler_state_dict': scheduler.state_dict(),
         # 'rng_state': torch.get_rng_state(),  # 可选但推荐
     }
 
-    torch.save(checkpoint, SAVE_PATH)
+    torch.save(checkpoint, SAVE_PTH_PATH)
 
-    m,s = mean(loss_logger), pstdev(loss_logger)
-    best = min(loss_logger)
+    m, s = loss_logger.value, loss_logger.deviation**0.5  # mean and std of training loss
+    best = loss_logger.best
 
+    test_img_path = SAVE_IMG_PATH / f'test_{epoch}.jpg'
     print("═══════════════════════════════════════════════════════════════════════")
     print(f"EPOCH {epoch:>3d} COMPLETE")
     print(f"|Train Loss: {m:.4f} ± {s:.4f} (Best: {best:.4f}) | Valid Loss: ---")
     print(f"|BatchSize: {BATCH_SIZE} | LR: {LR} | Checkpoint: saved")
     print("───────────────────────────────────────────────────────────────────────")
-    print(f"Preview: {SAVE_IMG_PATH/f'test_{epoch}.jpg'} | FID: --(↓2.15)")
+    print(f"Preview: {test_img_path} | FID: {fid_score:.4f}")
     print("═══════════════════════════════════════════════════════════════════════\n")
