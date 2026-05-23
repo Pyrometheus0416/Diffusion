@@ -1,11 +1,19 @@
 from dataclasses import dataclass
 from typing import Iterable, TypeAlias, Callable
 from pathlib import Path
+import time
+import math
+import hashlib
+import json
+import uuid
 
-from PIL import Image
-import numpy as np
-from torch import Tensor
+import requests
+from torch import nn, Tensor
 from tqdm import tqdm
+
+from config import ARCH, TIME_DIM, TIMESTEP, DEVICE
+from api_key import APP_KEY, APP_SECRET
+from model import DDIM
 
 #--------------------------------------------------------------------
 ImgLoader: TypeAlias = Iterable[Tensor]
@@ -14,8 +22,8 @@ ImgLoader: TypeAlias = Iterable[Tensor]
 @dataclass
 class WelfordStats:
     n: int = 0
-    mean: Tensor = 0.0
-    M2: Tensor = 0.0
+    mean: Tensor|float = 0.0
+    M2: Tensor|float = 0.0
 
     def calculate(self, loader: ImgLoader):
         """
@@ -27,11 +35,11 @@ class WelfordStats:
         ```
         """
         
-        for images in tqdm(loader, "online calculate"):
-            B, C = images.size(0), images.size(1)
-            images = images.permute((1,0,2,3)).flatten(1)
-            mean_B = images.mean(1)
-            m2_B = (B-1) * images.var(1)
+        for x in tqdm(loader, "online calculate"):
+            B = x.size(0)
+            x = x.transpose(0,1).contiguous().flatten(1)
+            mean_B = x.mean(1)
+            m2_B = (B-1) * x.var(1)
 
             new_n = self.n + B
             delta = mean_B - self.mean
@@ -63,54 +71,100 @@ class WelfordStats:
 @dataclass
 class EMA:
     t: int = 0
-    decay: float = 0.999
-    value: float = 50.0
-    deviation: float = 0.0
-    best: float = float('inf')
-    lerp: Callable[[float, float, float], float] = lambda a,b,w: a + (b-a)*w
+    decay: float = 0.999  # value decay
+    decay_: float = 0.6   # delta decay
+    value: float = 0.0
+    delta: float = 0.0    # used to calculate the variance of the value
+    best: tuple[float, int] = (float('inf'), -1)  # the best value during training, used for reference only
+    lerp: Callable[[float, float, float], float] = lambda a,b,w: a + w*(b-a)
 
-    def update(self, new_value: float):
+    def update(self, x: float):
+        assert not math.isnan(x), "EMA WARNNING: Get a NAN value!"
+        
         if self.t == 0:
-            self.value = new_value
-        else:
-            self.value = self.lerp(self.value, new_value, 1-self.decay)
-        # equivalent to the above line but more numerically stable
-        self.deviation = self.lerp(self.deviation, (self.value - new_value)**2, 1-self.decay)
-        self.best = min(self.best, self.value)
+            self.value = x
+            self.delta = 0.0
+
+        self.value = self.lerp(self.value, x, 1-self.decay)
+        self.delta = self.lerp(self.delta, (self.value - x)**2, 1-self.decay_)
+        self.best = (min(self.best, self.value), self.t)  # update the best value and its time step
         self.t += 1
 
     def reset(self):
-        self.value = 0.0
-
-
-def compute_average_image(image_folder: Path):
-
-    image_files = image_folder.glob("[0-9]*-[0-9]*.jpg")
-
-    base_array = np.zeros((256,256,3), dtype=np.float32)
-    cnt = 0
-
-    for img_path in image_files:
-        width = int(img_path.name[0])
-        if 4 <= width <= 7:
-            continue
-
-        img = Image.open(img_path)
-        img = img.resize((256,256))
-        base_array += np.array(img, dtype=np.float32)
-        cnt += 1
-        print(cnt, img_path)
-            
-    average_array = base_array / cnt
-
-    average_image = Image.fromarray(np.uint8(average_array))
+        self.t = 0  # the value and delta will be reset when t is 0
+        self.best = (float('inf'), -1)
     
-    return average_image
+    @property
+    def stdev(self):
+        return self.delta**0.5
+
+
+def summary(model: nn.Module) -> tuple[int, int]:
+    MB = 1024 * 1024
+    n = sum(p.numel() for p in model.parameters())
+    m = sum(p.numel() * p.element_size() for p in model.parameters())
+    print(f"The number of parameters: {n}.".center(50, '-'))
+    print(f"The size of parameters: {m/MB:.2f} MB.".center(50, '-'))
+    return n, m
+
+
+@dataclass
+class YoudaoTranslator:
+    """
+    Youdao 翻译器的简单封装（使用有道开放接口 v3）。
+    """
+
+    YOUDAO_URL: str = "https://openapi.youdao.com/api"
+    app_key: str = APP_KEY
+    app_secret: str = APP_SECRET
+    TEST = "The quick brown fox jumps over the lazy dog."
+
+    @staticmethod
+    def _encrypt(sign_str: str) -> str:
+        h = hashlib.sha256()
+        h.update(sign_str.encode('utf-8'))
+        return h.hexdigest()
+
+    @staticmethod
+    def _truncate(q: str|None) -> str:
+        s = len(str(q))
+        return q if s <= 20 else ''.join([q[0:10], str(s), q[s - 10:]])
+
+    def translate(self, q: str = TEST, src: str = 'en', tgt: str = 'zh-CHS') -> dict:
+        """Translate text `q` from `src` to `tgt` using Youdao API.\\
+        Returns the parsed JSON response as a dict.
+        """
+        data = {
+            'q': q,
+            'from': src,
+            'to': tgt,
+            'signType': 'v3',
+            'curtime': str(int(time.time())),
+            'appKey': self.app_key,
+            'salt': str(uuid.uuid1()),
+        }
+
+        sign_str = ''.join([
+            self.app_key,
+            self._truncate(q),
+            data['salt'],
+            data['curtime'],
+            self.app_secret,
+        ])
+
+        data['sign'] = self._encrypt(sign_str)
+
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        response = requests.post(self.YOUDAO_URL, data=data, headers=headers)
+        return json.loads(response.content.decode())
+
+    # allow calling instance directly for convenience
+    def __call__(self, q: str = TEST, src: str = 'en', tgt: str = 'zh-CHS') -> dict:
+        return self.translate(q, src=src, tgt=tgt)
+
+
 
 #--------------------------------------------------------------------
 if __name__ == "__main__":
-    src = Path(r"E:\CodeHub\Mydata\AnimeFace")
-
-    avg_img = compute_average_image(src)
-    if avg_img:
-        avg_img.show()
+    youdao = YoudaoTranslator()
+    print(youdao()['translation'])
