@@ -10,17 +10,17 @@ from torchmetrics.image.fid import FrechetInceptionDistance as FID
 
 from tqdm import tqdm
 
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 from config import *  # import all config variables, CONSTANTS and TYPE ALIASES
 from model import DDIM
 from img_dataset import AnimeFaceDataset
 
 from utils import EMA
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 torch.set_default_device(DEVICE)
 torch.set_default_dtype(DTYPE)
 
-#====================================================================
+#════════════════════════════════════════════════════════════════════
 assert IMG_FLODER.exists(), f"Image folder {IMG_FLODER} does not exist."
 if not SAVE_PTH_PATH.exists():
     CONTINUE = False  # No checkpoint to continue
@@ -28,9 +28,9 @@ if not SAVE_PTH_PATH.exists():
 if not SAVE_IMG_PATH.exists():
     SAVE_IMG_PATH.mkdir(parents=True, exist_ok=True)
 
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 face_dataset = AnimeFaceDataset(IMG_FLODER)
-print("▤ The dataset capability is",len(face_dataset))
+print("▤ The dataset capability is", len(face_dataset))
 curr_epoch = 0  # init epoch as default
 
 ddim_fid = FID(reset_real_features=False)
@@ -43,8 +43,8 @@ for img in tqdm(fid_dataloader, "Initialize FID of real data"):
     ddim_fid.update(img, real=True)
 face_dataset.reset()
 
-#--------------------------------------------------------------------
-ddim = DDIM(ARCH, TIMESTEP, TIME_DIM, DEVICE)
+#────────────────────────────────────────────────────────────────────
+ddim = DDIM(ARCH, TIMESTEP, TIME_DIM)
 ddim_optim = optim.Adam(ddim.parameters(), lr=LR, betas=ADAM_BETAS)
 scaler = GradScaler(DEVICE)
 loss_logger = EMA()

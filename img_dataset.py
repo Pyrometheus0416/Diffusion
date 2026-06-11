@@ -10,11 +10,11 @@ from torchvision.io import decode_image, write_jpeg
 
 from config import DEVICE, DTYPE
 
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 torch.set_default_device(DEVICE)
 torch.set_default_dtype(DTYPE)
 
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 @dataclass
 class AnimeFaceDataset(Dataset):
     floder: Path

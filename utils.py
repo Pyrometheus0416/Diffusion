@@ -14,11 +14,9 @@ from tqdm import tqdm
 from config import ARCH, TIME_DIM, TIMESTEP, DEVICE
 from api_key import APP_KEY, APP_SECRET
 from model import DDIM
-
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 ImgLoader: TypeAlias = Iterable[Tensor]
-
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 @dataclass
 class WelfordStats:
     n: int = 0
@@ -163,8 +161,7 @@ class YoudaoTranslator:
         return self.translate(q, src=src, tgt=tgt)
 
 
-
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     youdao = YoudaoTranslator()
     print(youdao()['translation'])

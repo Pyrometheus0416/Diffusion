@@ -9,14 +9,14 @@ from torchvision.ops import MLP
 
 from tqdm import tqdm
 
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 Res_Ch = namedtuple('Res_Ch', ['i', 'm', 'o'])
 Layer_Ch = namedtuple('Layer_Ch', ['i', 'm', 'e', 'o'])
 "input, middle, enhance, output"
 
 Arch = tuple[Layer_Ch, ...]
 
-#--------------------------------------------------------------------
+#────────────────────────────────────────────────────────────────────
 def sinPosEmbed( time_step, dim) -> Tensor:
     half_dim = dim // 2                        # i in range(half_dim)
     pos_arr = torch.arange(time_step+1)        # [0, ..., T]
@@ -25,7 +25,7 @@ def sinPosEmbed( time_step, dim) -> Tensor:
     raw_embeddings = torch.outer(pos_arr, cycle) # <timestep+1 , half_dim>
 
     embeddings = torch.zeros((time_step+1,dim))  # <timestep+1 , 2*half_dim>
-    embeddings[:,0::2] = raw_embeddings.sin()  # slice assignment
+    embeddings[:,0::2] = raw_embeddings.sin()    # slice assignment
     embeddings[:,1::2] = raw_embeddings.cos()
     
     return embeddings
@@ -194,7 +194,6 @@ class DDIM(nn.Module):
     arch: Arch
     T: int             # time steps
     time_emb_dim: int  # the dimension of time embedding, alias: ted
-    device: torch.device
 
     def __post_init__(self):
         super().__init__()
