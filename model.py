@@ -1,41 +1,31 @@
-from typing import cast,TypeAlias
+from dataclasses import dataclass
+from typing import Sequence, cast
 from collections import namedtuple, deque
+from itertools import pairwise
 
 import torch
-from torch import nn
+from torch import nn, Tensor
 from torchvision.ops import MLP
 
 from tqdm import tqdm
 
-#--------------------------------------------------------------------
-Tensor: TypeAlias = torch.Tensor
+#────────────────────────────────────────────────────────────────────
 Res_Ch = namedtuple('Res_Ch', ['i', 'm', 'o'])
 Layer_Ch = namedtuple('Layer_Ch', ['i', 'm', 'e', 'o'])
 "input, middle, enhance, output"
 
 Arch = tuple[Layer_Ch, ...]
 
-#--------------------------------------------------------------------
-ARCH: Arch = (
-    Layer_Ch(64,  64,  64, 64),
-    Layer_Ch(64,  128, 0, 128),
-    Layer_Ch(128, 256, 0, 256),
-    Layer_Ch(256, 256, 0, 512)
-) # Diffusion/unet_diffusion.png
-
-TIME_DIM = 512
-TIMESTEP = 1000
-
-#--------------------------------------------------------------------
-def sinPosEmbed( time_step = TIMESTEP, dim = TIME_DIM):
-    half_dim = dim // 2                       # i in range(half_dim)
-    pos_arr = torch.arange(time_step)
+#────────────────────────────────────────────────────────────────────
+def sinPosEmbed( time_step, dim) -> Tensor:
+    half_dim = dim // 2                        # i in range(half_dim)
+    pos_arr = torch.arange(time_step+1)        # [0, ..., T]
     lg_cycle = -torch.arange(half_dim) / half_dim
-    cycle = 10000 ** lg_cycle                    # <half_dim>
-    raw_embeddings = torch.outer(pos_arr, cycle) # <timestep, half_dim>
+    cycle = 2*torch.pi * 1024 ** lg_cycle        # <half_dim>
+    raw_embeddings = torch.outer(pos_arr, cycle) # <timestep+1 , half_dim>
 
-    embeddings = torch.zeros((time_step,dim)) # <timestep, 2*half_dim>
-    embeddings[:,0::2] = raw_embeddings.sin() # slice assignment
+    embeddings = torch.zeros((time_step+1,dim))  # <timestep+1 , 2*half_dim>
+    embeddings[:,0::2] = raw_embeddings.sin()    # slice assignment
     embeddings[:,1::2] = raw_embeddings.cos()
     
     return embeddings
@@ -46,11 +36,11 @@ class ResBlock(nn.Module):
         super().__init__()
         self.ch = ch
         self.norm1 = nn.GroupNorm(num_groups, ch.i)
-        self.conv1 = nn.Conv2d(ch.i, ch.m, 3, padding=1)
+        self.conv1 = nn.Conv2d(ch.i, ch.m, 3, 1, 1, padding_mode='replicate')
         self.norm2 = nn.GroupNorm(num_groups, ch.m)
-        self.conv2 = nn.Conv2d(ch.m, ch.o, 3, padding=1)
+        self.conv2 = nn.Conv2d(ch.m, ch.o, 3, 1, 1, padding_mode='replicate')
         self.time_proj = nn.Linear(time_emb_dim, ch.m)
-        self.act = nn.SiLU()  # 或 nn.SiLU(inplace=True)
+        self.act = nn.SiLU(inplace=True)
         self.shortcut = nn.Conv2d(ch.i, ch.o, 1)
 
     def forward(self, x: Tensor, t_emb):
@@ -59,8 +49,8 @@ class ResBlock(nn.Module):
         h = self.act(h)
         h = self.conv1(h)
 
-        t_emb_local: Tensor = self.time_proj(t_emb) # <B, ch.m>
-        h = h + t_emb_local.view(B, self.ch.m, 1, 1) # <B, ch.m, H_, W_>
+        t_emb_local: Tensor = self.time_proj(t_emb)   # <B, ch.m>
+        h = h + t_emb_local.view(B, self.ch.m, 1, 1)  # <B, ch.m, H_, W_>
 
         h = self.norm2(h)
         h = self.act(h)
@@ -79,9 +69,9 @@ class AttnBlock(nn.Module):
     def forward(self, x: Tensor):
         B, C, H, W = x.shape
         h: Tensor = self.norm(x)
-        h = h.flatten(2).transpose(1,2) # <B, HW, C>
+        h = h.flatten(2).transpose(1,2)  # <B, HW, C>
         h, attn_weight = self.attn(h, h, h)
-        h = h.transpose(1,2).reshape((B,C,H,W)) # <B, C, H, W>
+        h = h.transpose(1,2).reshape((B,C,H,W))  # <B, C, H, W>
 
         return x + self.proj(h)
 
@@ -104,7 +94,7 @@ class DownLayer(nn.Module):
         self.res1 = ResBlock(ch_res1, time_emb_dim)
         self.res2 = ResBlock(ch_res2, time_emb_dim)
 
-        self.down = nn.Conv2d(ch.o, ch.o, 3, 2, 1)
+        self.down = nn.Conv2d(ch.o, ch.o, 3, 2, 1, padding_mode='replicate')
     
     def forward(self, x, t_emb):
         h = self.res1(x, t_emb)
@@ -120,7 +110,7 @@ class UpLayer(nn.Module):
         super().__init__()
         self.ch = ch
         self.is_head = is_head
-        self.ch_cat = 2*ch.i # with the concated tensor
+        self.ch_cat = 2*ch.i  # with the concated tensor
 
         ch_res1 = Res_Ch(self.ch_cat, self.ch_cat, ch.m)
 
@@ -131,13 +121,13 @@ class UpLayer(nn.Module):
         else:
             ch_res2 = Res_Ch(ch.m, ch.m, ch.o)
         
-        self.up = nn.ConvTranspose2d(ch.i, ch.i, 4, 2, 1)
+        self.up = nn.ConvTranspose2d(ch.i, ch.i, 4, 2, 1)  # only support zeros padding
         self.res1 = ResBlock(ch_res1, time_emb_dim)
         self.res2 = ResBlock(ch_res2, time_emb_dim)
     
     def forward(self, x, concat, t_emb):
         h = x if self.is_head else self.up(x)
-        h = torch.cat((h,concat), dim=1) # concat in C dim
+        h = torch.cat((h,concat), dim=1)  # concat in C dim
         h = self.res1(h, t_emb)
         h = self.res2(h, t_emb)
         if self.ch.e != 0: h = self.res3(h, t_emb)
@@ -161,24 +151,25 @@ class Bridge(nn.Module):
         h = self.res2(h, t_emb)
         return h
 
+
 class Unet(nn.Module):
     def __init__(self, arch: Arch, time_emb_dim):
         super().__init__()
-        self.num_layers = len(arch) # default 4 (ch:64->512)
+        self.num_layers = len(arch)  # default 4 (ch:64->512)
         self.encoder_arch = arch
         self.decoder_arch = tuple(Layer_Ch(c.o, c.m, c.e, c.i) for c in reversed(arch))
 
         self.time_dim = ted = time_emb_dim
         self.store = deque([], self.num_layers)
-        self.input_conv = nn.Conv2d(3, arch[0].i, 3, padding=1)
-        self.out_conv = nn.Conv2d(arch[0].i, 3, 3, padding=1)
+        self.input_conv = nn.Conv2d(3, arch[0].i, 3, 1, 1, padding_mode='replicate')
+        self.out_conv = nn.Conv2d(arch[0].i, 3, 3, 1, 1, padding_mode='replicate')
 
         self.encoder = nn.ModuleList( DownLayer(io_ch, ted) for io_ch in self.encoder_arch)
-        tail_layer = cast(DownLayer, self.encoder[-1])
+        tail_layer: DownLayer = cast(DownLayer, self.encoder[-1])
         tail_layer.is_tail = True
 
         self.decoder = nn.ModuleList( UpLayer(io_ch, ted) for io_ch in self.decoder_arch)
-        head_layer = cast(UpLayer, self.decoder[0])
+        head_layer: UpLayer = cast(UpLayer, self.decoder[0])
         head_layer.is_head = True
         # The decoder has an architecture symmetric to that of the encoder.
 
@@ -198,64 +189,58 @@ class Unet(nn.Module):
         return y
 
 
-class DDPM(nn.Module):
-    def __init__(self, arch, dim, time_emb_dim):
+@dataclass(unsafe_hash=True)
+class DDIM(nn.Module):
+    arch: Arch
+    T: int             # time steps
+    time_emb_dim: int  # the dimension of time embedding, alias: ted
+
+    def __post_init__(self):
         super().__init__()
-        self.arch = arch
 
-        self.T = TIMESTEP
-        self.time_emb_dim = ted = time_emb_dim
-        self.time_emb = sinPosEmbed(self.T, ted)
+        ted = self.time_emb_dim
+        self.time_emb = sinPosEmbed(self.T, ted) # <T, time_emb_dim>
 
-        s = 0.008
-        timesteps = torch.arange(self.T + 1, dtype=torch.float32) / self.T # 0...T
-        alpha_bar = torch.cos((timesteps + s) / (1 + s) * torch.pi / 2) ** 2
-        alpha_bar = alpha_bar / alpha_bar[0]
-        betas = 1 - (alpha_bar[1:] / alpha_bar[:-1]) # 1...T
-        self.beta = torch.clip(betas, 0, 0.999)
-        self.alpha_bar = alpha_bar[1:] / alpha_bar[0]  # 1...T
+        s = 0.0008
+        timesteps_norm = torch.arange(self.T + 1, dtype=torch.float32) / self.T
+        self.theta = ((1-2*s)*timesteps_norm+s) * torch.pi/2  # [0, ..., T] → [s*pi/2, (1-s)*pi/2]
 
-        # self.beta = torch.linspace(0.0001, 0.02, self.T)
-        # self.alpha = 1-self.beta
-        # self.alpha_bar = torch.cumprod(self.alpha, dim=0)
-
-        self.sigma = torch.sqrt(self.beta)  # DDPM 使用 σ_t = sqrt(β_t)
-
-        self.denoiser = Unet(arch, ted)
+        self.denoiser = Unet(self.arch, ted)
         self.time_mlp = MLP(ted, [ted,ted], activation_layer=nn.SiLU)
 
-    def denoise(self, xt, t: Tensor):
-        t_emb = self.time_emb[t-1]  # t>0
-        t_emb = self.time_mlp(t_emb)
-        eps_pred = self.denoiser(xt, t_emb)
-        return eps_pred
-    
+    def predicter(self, xt, t: Tensor) -> Tensor:
+        t_emb = self.time_mlp( self.time_emb[t] )
+        x0_pred = self.denoiser(xt, t_emb)
+        return x0_pred
 
     @torch.no_grad()
-    def sample(self, shape, device):
+    def sample(self, shape: Sequence, eta: float, tau: list[int]):
 
-        B = shape[0]
+        B, C, H, W = shape
+        tau = sorted(set(tau))  # remove duplicates and sort
 
-        # 初始化 x_T ~ N(0, I)
-        x = torch.randn(shape, device=device)
+        assert tau[0] == 0, "tau_1 should be 0."
+        assert tau[-1] == self.T, "tau_k should be T."
+        assert 0.0 <= eta <= 1.0, "eta should be in [0.0, 1.0]."
 
-        steps = list(range(self.T, 0, -1))
+        x = torch.randn(shape)           # x_T ~ N(0, I)
+        # TODO Perlin Noise and FBM
+        steps = pairwise(reversed(tau))  # (tau_k, tau_{k-1}), (tau_{k-1}, tau_{k-2}), ..., (tau_2, tau_1)
+        theta_eta: Tensor = torch.tensor(torch.pi / 2 * eta)
 
-        for t in tqdm(steps, "Sample"):
-            t_batch = torch.full((B,), t, device=device, dtype=torch.long)
+        for t_cur, t_pre in tqdm(steps, "DDIM Sample", leave=False):
+            t_batch = torch.full((B,), t_cur, dtype=torch.int)
 
-            eps_pred = self.denoise(x, t_batch)
+            x0_pred = self.predicter(x, t_batch)
+            if t_pre == 0:  return x0_pred  # x_0 is the final output when t_pre=0
+            
+            theta_cur = self.theta[t_cur]  # alpha_bar_cur
+            theta_pre = self.theta[t_pre]  # alpha_bar_pre
 
-            alpha_t = 1-self.beta[t-1]
-            alpha_bar_t = self.alpha_bar[t-1]
-            sigma_t = self.sigma[t-1]
+            z = torch.randn(shape)
 
-            z = torch.randn_like(x)
-
-            # 重参数化：x_{t-1} = (1/√α_t)(x_t - (1-α_t)/√(1-ᾱ_t) * ε_θ) + σ_t * z
-            scale = 1/torch.sqrt(alpha_t)
-            shift = (1-alpha_t) / torch.sqrt(1-alpha_bar_t)
-            var = sigma_t * z
-            x = scale * (x-shift*eps_pred) + var
+            pred_noise = (x - theta_cur.cos()*x0_pred) / theta_cur.sin()  # ε_t
+            mean_x = theta_pre.cos()*x0_pred + theta_pre.sin()*pred_noise*theta_eta.cos()
+            x = mean_x + theta_pre.sin()*theta_eta.sin()*z
 
         return x
