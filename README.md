@@ -1,4 +1,4 @@
-# Diffusion
+# Diffusion(WIP)
 
 A CNN+UNet based Diffusion model for image generation.
 
@@ -29,32 +29,14 @@ git clone https://github.com/Pyrometheus0416/Diffusion.git
 cd Diffusion
 ```
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+2. Install dependencies
 
-## Usage
-
-[Add usage instructions here]
-
-### Training
-
-[Add training instructions here]
-
-### Inference
-
-[Add inference/generation instructions here]
 
 ## Model Architecture
 
 The model combines:
 - **CNN**: For initial feature extraction and processing
 - **UNet**: For the main diffusion model architecture with skip connections
-
-## Results
-
-[Add results, examples, and visualizations here]
 
 ## Contributing
 
