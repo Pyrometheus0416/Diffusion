@@ -1,0 +1,163 @@
+from dataclasses import dataclass
+from pathlib import Path
+#--------------------------------------------------------------------
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch import Tensor
+from torch.utils.data import Dataset, DataLoader
+from torch.amp import autocast, GradScaler
+
+import torchvision.transforms.v2 as transforms
+from torchvision.io import decode_image, write_jpeg
+
+from torchmetrics.image.fid import FrechetInceptionDistance as FID
+
+from tqdm import tqdm
+
+#--------------------------------------------------------------------
+from CFM_model import ConditionFlowMatching
+from CFM_model import ARCH, TIMESTEP, TIME_DIM
+from img_dataset import AnimeFaceDataset
+
+from utils import EMA
+#--------------------------------------------------------------------
+torch.set_default_device('cpu') # 'cuda:0  [IMPORTANT!!!]
+DEVICE = torch.device('cpu') # 'cuda:0'
+torch.set_default_dtype(torch.float32)
+
+#--------------------------------------------------------------------
+CONTINUE = False
+
+EPOCH = 16
+BATCH_SIZE = 8
+LR = 0.00005
+
+BETAS = (0.9, 0.999)
+
+#--------------------------------------------------------------------
+IMG_FLODER = Path(r"E:\CodeHub\Mydata\AnimeFace") # [IMPORTANT!!!]
+SAVE_PTH_PATH  = Path(__file__).parent / 'cfm_model.pth'
+SAVE_IMG_PATH = Path(__file__).parent / 'cfm_samples'
+
+assert IMG_FLODER.exists(), f"Image folder {IMG_FLODER} does not exist. Please check the path."
+if not SAVE_PTH_PATH.exists():
+    CONTINUE = False  # No checkpoint to continue
+    print(f"Warning: Checkpoint {SAVE_PTH_PATH} don't exists.")
+if not SAVE_IMG_PATH.exists():
+    SAVE_IMG_PATH.mkdir(parents=True, exist_ok=True)
+
+#--------------------------------------------------------------------
+face_dataset = AnimeFaceDataset(IMG_FLODER)
+print("▤ The dataset capability is",len(face_dataset))
+curr_epoch = 0  # init epoch as default
+
+cfm_fid = FID(reset_real_features=False)
+
+# init the fid with real dataset
+face_dataset.transform = fid_transform = transforms.Resize(face_dataset.size)
+# temporary transform for FID evaluation (without data augmentation)
+fid_dataloader = DataLoader(
+    face_dataset,
+    shuffle=True,
+    batch_size=BATCH_SIZE,
+    drop_last=True,
+    generator=torch.Generator(device=DEVICE) # [IMPORTANT!!!]
+)
+cfm_fid.reset()
+for img in tqdm(fid_dataloader, "Evaluating FID of real data"):
+    cfm_fid.update(img, real=True)
+face_dataset.reset()
+
+#--------------------------------------------------------------------
+
+cfm = ConditionFlowMatching(ARCH, TIME_DIM, TIMESTEP)
+cfm_optim = optim.Adam(cfm.parameters(), lr=LR, betas=BETAS)
+scaler = GradScaler(DEVICE)
+loss_logger = EMA()
+
+dataloader = DataLoader(
+        face_dataset,
+        shuffle=True,
+        batch_size=BATCH_SIZE,
+        drop_last=True,
+        generator=torch.Generator(device=DEVICE) # [IMPORTANT!!!]
+    )
+
+if CONTINUE:
+    assert SAVE_PTH_PATH.exists(), "No pre-trained model detected, cannot continue training."
+
+    print('Loading pre-trained model...')
+    checkpoint: dict = torch.load(SAVE_PTH_PATH)
+    curr_epoch = checkpoint['epoch'] + 1
+    cfm.load_state_dict(checkpoint['cfm'])
+    cfm_optim.load_state_dict(checkpoint['cfm_optim'])
+    cfm_fid.load_state_dict(checkpoint['cfm_fid'])
+    scaler.load_state_dict(checkpoint['scaler'])
+    print('Start training from loaded model...')
+
+
+for epoch in range(curr_epoch, curr_epoch+EPOCH):
+
+    cfm.train()
+    for x1 in tqdm(dataloader, "Train"):
+        x1: Tensor = x1.to(DEVICE)
+        
+        t = torch.rand(x1.shape[0], device=DEVICE)
+        x0 = torch.randn_like(x1)  # standard Gaussian noise as x0
+
+        x_t = torch.lerp(x0, x1, t.view(-1, 1, 1, 1))  # path interpolation
+        v_target = x1 - x0
+
+        # Predict velocity
+        with autocast(DEVICE, dtype= torch.float16):
+            v_pred = cfm.velocity_predicter(x_t, t)
+            loss = nn.functional.mse_loss(v_pred, v_target)
+        
+        loss_logger.update(loss.item())
+
+        scaler.scale(loss).backward()
+        scaler.step(cfm_optim)
+        scaler.update()
+        cfm_optim.zero_grad()
+
+    cfm.eval()
+    test_img_path = SAVE_IMG_PATH / f'test_{epoch}.jpg'
+    with torch.inference_mode():
+        h = w = face_dataset.size
+        x0_prod = cfm.sample((1,3,h,w), DEVICE)
+        image = face_dataset.inv_trans(x0_prod[0])
+        # image = image.cpu() [IMPORTANT!!!]
+
+        write_jpeg(image, test_img_path)
+
+        for batch in tqdm(range(len(face_dataset) // BATCH_SIZE), "Evaluating FID of generated data"):
+            x0_prod = cfm.sample((BATCH_SIZE,3,h,w), DEVICE)
+            img_prod = face_dataset.inv_trans(x0_prod)
+            cfm_fid.update(img_prod, real=False)
+        fid_score = cfm_fid.compute().item()
+        # cfm_fid.reset()  # reset FID generator features for the next epoch
+
+    checkpoint = {
+        'epoch': epoch,
+        'cfm': cfm.state_dict(),
+        'cfm_optim': cfm_optim.state_dict(),
+        'loss': loss,
+        'cfm_fid': cfm_fid.state_dict(),
+        'scaler': scaler.state_dict(),
+        # 'scheduler_state_dict': scheduler.state_dict(),
+        # 'rng_state': torch.get_rng_state(),  # 可选但推荐
+    }
+
+    torch.save(checkpoint, SAVE_PTH_PATH)
+
+    m, s = loss_logger.value, loss_logger.deviation**0.5  # mean and std of training loss
+    best = loss_logger.best
+
+    print("═══════════════════════════════════════════════════════════════════════")
+    print(f"EPOCH {epoch:>3d} COMPLETE")
+    print(f"|Train Loss: {m:.4f} ± {s:.4f} (Best: {best:.4f}) | Valid Loss: ---")
+    print(f"|BatchSize: {BATCH_SIZE} | LR: {LR} | Checkpoint: saved")
+    print("───────────────────────────────────────────────────────────────────────")
+    print(f"Preview: {test_img_path} | FID: {fid_score:.4f}")
+    print("═══════════════════════════════════════════════════════════════════════\n")
